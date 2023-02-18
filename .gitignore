@@ -23,3 +23,4 @@ out/
 build/
 
 .env
+*.js
