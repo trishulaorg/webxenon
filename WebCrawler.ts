@@ -1,5 +1,5 @@
 import Crawler, { CrawlerRequestResponse } from "crawler";
-import mysql from "mysql2/promise";
+import mysql, { OkPacket } from "mysql2/promise";
 import winston from "winston";
 
 export interface WebCrawlerOptions {
@@ -88,11 +88,80 @@ export default class WebCrawler {
       ],
     });
   }
+  private async dequeueUrls(count: number): Promise<string[]> {
+    const urls: string[] = [];
+    let dequeuedCount = 0;
 
-  async start() {
-    await this.createTables();
+    while (dequeuedCount < count) {
+      const url = await this.dequeueUrl();
 
-    this.queueUrls([this.targetUrl]);
+      if (url === undefined) {
+        break;
+      }
+
+      urls.push(url);
+      dequeuedCount++;
+    }
+
+    return urls;
+  }
+  private async dequeueUrl(): Promise<string | undefined> {
+    const connection = await this.pool.getConnection();
+
+    try {
+      const [rows] = (await connection.query(
+        `
+      SELECT id FROM \`${this.queueTableName}\` WHERE \`${this.isCrawledColumnName}\` = 0 AND \`depth\` <= ?
+      ORDER BY \`depth\` ASC, \`id\` ASC LIMIT ?
+    `,
+        [this.maxDepth, 1]
+      )) as any;
+
+      const ids = rows.map((row: any) => (row as any).id);
+      console.error(rows);
+
+      if (ids.length === 0) {
+        return undefined;
+      }
+
+      await connection.query(
+        `
+      UPDATE \`${this.queueTableName}\` SET \`${this.isCrawledColumnName}\` = 1 WHERE \`id\` IN (?)
+    `,
+        [ids]
+      );
+
+      return (rows[0] as any)[this.urlColumnName];
+    } catch (error) {
+      if (error instanceof Error)
+        this.logger.error(`Error dequeuing URL: ${error.message}`);
+      return undefined;
+    } finally {
+      connection.release();
+    }
+  }
+  public async start() {
+    this.logger.info("Starting WebXenon...");
+
+    try {
+      await this.createTables();
+      let url = await this.dequeueUrl();
+
+      while (url !== undefined) {
+        const crawler = new Crawler({
+          maxDepth: this.maxDepth,
+          callback: this.processPage.bind(this),
+        });
+        crawler.queue(url);
+
+        url = await this.dequeueUrl();
+      }
+    } catch (error) {
+      if (error instanceof Error)
+        this.logger.error(`Error starting WebXenon: ${error.message}`);
+    }
+
+    this.logger.info("WebXenon stopped.");
   }
   private async processPage(
     error: Error | null,
@@ -116,13 +185,12 @@ export default class WebCrawler {
 
       // Insert or update page in database
       const connection = await this.pool.getConnection();
-      try {
-        await connection.beginTransaction();
 
+      try {
         const [result] = await connection.query(
           `
-          SELECT * FROM \`${this.tableName}\` WHERE \`${this.urlColumnName}\` = ?
-        `,
+        SELECT * FROM \`${this.tableName}\` WHERE \`${this.urlColumnName}\` = ?
+      `,
           [url]
         );
 
@@ -130,22 +198,22 @@ export default class WebCrawler {
           // Page already exists, update it
           await connection.query(
             `
-            UPDATE \`${this.tableName}\` SET
-              \`${this.titleColumnName}\` = ?,
-              \`${this.descriptionColumnName}\` = ?,
-              \`${this.rawHtmlColumnName}\` = ?
-            WHERE \`${this.urlColumnName}\` = ?
-          `,
+          UPDATE \`${this.tableName}\` SET
+            \`${this.titleColumnName}\` = ?,
+            \`${this.descriptionColumnName}\` = ?,
+            \`${this.rawHtmlColumnName}\` = ?
+          WHERE \`${this.urlColumnName}\` = ?
+        `,
             [title, description, $.html(), url]
           );
         } else {
           // Page doesn't exist, insert it
           await connection.query(
             `
-            INSERT INTO \`${this.tableName}\`
-              (\`${this.urlColumnName}\`, \`${this.titleColumnName}\`, \`${this.descriptionColumnName}\`, \`${this.rawHtmlColumnName}\`)
-            VALUES (?, ?, ?, ?)
-          `,
+          INSERT INTO \`${this.tableName}\`
+            (\`${this.urlColumnName}\`, \`${this.titleColumnName}\`, \`${this.descriptionColumnName}\`, \`${this.rawHtmlColumnName}\`)
+          VALUES (?, ?, ?, ?)
+        `,
             [url, title, description, $.html()]
           );
         }
@@ -153,17 +221,15 @@ export default class WebCrawler {
         // Mark URL as crawled
         await connection.query(
           `
-          UPDATE \`${this.queueTableName}\` SET \`${this.isCrawledColumnName}\` = 1 WHERE \`${this.urlColumnName}\` = ?
-        `,
+        UPDATE \`${this.queueTableName}\` SET \`${this.isCrawledColumnName}\` = 1 WHERE \`${this.urlColumnName}\` = ?
+      `,
           [url]
         );
 
-        await connection.commit();
-      } catch (error) {
-        await connection.rollback();
-        throw error;
-      } finally {
         connection.release();
+      } catch (error) {
+        connection.release();
+        throw error;
       }
 
       if (depth < this.maxDepth) {
@@ -186,56 +252,71 @@ export default class WebCrawler {
 
   private async createTables() {
     const connection = await this.pool.getConnection();
+
     try {
       await connection.query(`
-        CREATE TABLE IF NOT EXISTS \`${this.tableName}\` (
-          \`id\` INT(11) NOT NULL AUTO_INCREMENT,
-          \`${this.urlColumnName}\` TEXT NOT NULL,
-          \`${this.titleColumnName}\` TEXT DEFAULT NULL,
-          \`${this.descriptionColumnName}\` TEXT DEFAULT NULL,
-          \`${this.rawHtmlColumnName}\` LONGTEXT DEFAULT NULL,
-          PRIMARY KEY (\`id\`),
-          UNIQUE KEY \`${this.urlColumnName}\` (\`${this.urlColumnName}\`)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-      `);
+      CREATE TABLE IF NOT EXISTS \`${this.tableName}\` (
+        \`id\` INT(11) NOT NULL AUTO_INCREMENT,
+        \`${this.urlColumnName}\` TEXT NOT NULL,
+        \`${this.titleColumnName}\` TEXT DEFAULT NULL,
+        \`${this.descriptionColumnName}\` TEXT DEFAULT NULL,
+        \`${this.rawHtmlColumnName}\` LONGTEXT DEFAULT NULL,
+        PRIMARY KEY (\`id\`),
+        UNIQUE KEY \`${this.urlColumnName}\` (\`${this.urlColumnName}\`(255))
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
 
       await connection.query(`
-        CREATE TABLE IF NOT EXISTS \`${this.queueTableName}\` (
-          \`id\` INT(11) NOT NULL AUTO_INCREMENT,
-          \`${this.urlColumnName}\` TEXT NOT NULL,
-          \`${this.isCrawledColumnName}\` TINYINT(1) NOT NULL DEFAULT '0',
-          PRIMARY KEY (\`id\`),
-          UNIQUE KEY \`${this.urlColumnName}\` (\`${this.urlColumnName}\`)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-      `);
+      CREATE TABLE IF NOT EXISTS \`${this.queueTableName}\` (
+        \`id\` INT(11) NOT NULL AUTO_INCREMENT,
+        \`${this.urlColumnName}\` TEXT NOT NULL,
+        \`depth\` INT(11) NOT NULL DEFAULT 0,
+        \`${this.isCrawledColumnName}\` TINYINT(1) NOT NULL DEFAULT 0,
+        PRIMARY KEY (\`id\`),
+        UNIQUE KEY \`${this.urlColumnName}\` (\`${this.urlColumnName}\`(255))
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
+      await connection.query(
+        `
+      INSERT INTO \`${this.queueTableName}\` (\`${this.urlColumnName}\`, \`depth\`) VALUES (?, ?)
+    `,
+        [this.targetUrl, 0]
+      );
     } catch (error) {
-      this.logger.error("Error creating database tables:", error);
-      throw error;
+      // check error type is Error
+      if (error instanceof Error) {
+        this.logger.error(`Error creating tables: ${error.message}`);
+      }
     } finally {
       connection.release();
     }
   }
 
-  private async queueUrls(urls: string[]) {
+  private async queueUrls(urls: string[]): Promise<void> {
     const connection = await this.pool.getConnection();
+
     try {
       await connection.beginTransaction();
 
       for (const url of urls) {
-        const [result] = await connection.query(
-          `
-          SELECT * FROM \`${this.queueTableName}\` WHERE \`${this.urlColumnName}\` = ?
-        `,
-          [url]
-        );
-
-        if (Array.isArray(result) && result.length === 0) {
-          await connection.query(
+        try {
+          const [result] = (await connection.query(
             `
-            INSERT INTO \`${this.queueTableName}\` (\`${this.urlColumnName}\`) VALUES (?)
-          `,
-            [url]
-          );
+          INSERT INTO \`${this.queueTableName}\`
+            (\`${this.urlColumnName}\`, \`depth\`)
+          VALUES (?, ?)
+        `,
+            [url, 0]
+          )) as mysql.OkPacket[];
+
+          if (result?.insertId) {
+            this.logger.info(`Queued URL: ${url}`);
+          }
+        } catch (error: any) {
+          if (error.code !== "ER_DUP_ENTRY") {
+            throw error;
+          }
         }
       }
 
