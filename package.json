@@ -1,0 +1,19 @@
+{
+  "name": "webxenon",
+  "version": "1.0.0",
+  "description": "A mysterious web crawler",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "compile": "tsc"
+  },
+  "dependencies": {
+    "@types/crawler": "^1.2.2",
+    "crawler": "^1.0.0",
+    "dotenv": "^16.0.3",
+    "mysql2": "^2.3.0"
+  },
+  "devDependencies": {
+    "typescript": "^4.4.4"
+  }
+}
